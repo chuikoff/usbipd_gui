@@ -2,6 +2,7 @@ use winapi::shared::minwindef::{LPARAM, LRESULT, UINT, WPARAM};
 use winapi::shared::windef::{HBRUSH, HMENU, HWND};
 use winapi::um::libloaderapi::GetModuleHandleW;
 use winapi::um::processthreadsapi::ExitProcess;
+use winapi::um::shellapi::ShellExecuteW;
 use winapi::um::winuser::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, GetDlgItem, GetMessageW, LoadCursorW,
     PostQuitMessage, RegisterClassW, SendMessageW, ShowWindow, TranslateMessage, BS_DEFPUSHBUTTON,
@@ -168,9 +169,28 @@ unsafe extern "system" fn wnd_proc(
                     // Кнопка "Attach"
                     let selected = get_selected_device(hwnd, 100);
                     if let Some(bus_id) = selected {
-                        let result = run_usbipd_command(&format!("usbipd attach --wsl --busid {}", bus_id));
-                        if let Err(err) = result {
+                        let state = check_device_state(&bus_id);
+                        if let Some(state) = state {
+                            if state == "Not shared" {
+                                // Выполняем usbipd bind с правами администратора
+                                let bind_result = run_usbipd_bind_with_admin(&bus_id, hwnd);
+                                if bind_result.is_err() {
+                                    show_error(hwnd, &format!("Не удалось выполнить bind: {}", bind_result.unwrap_err()));
+                                    return 0;
+                                }
+                            }
+                        } else {
+                            show_error(hwnd, "Не удалось проверить состояние устройства");
+                            return 0;
+                        }
+                        // После bind (или если bind не нужен) выполняем attach
+                        let attach_result = run_usbipd_command(&format!("usbipd attach --wsl --busid {}", bus_id));
+                        if let Err(err) = attach_result {
                             show_error(hwnd, &format!("Ошибка подключения: {}", err));
+                        } else {
+                            // Обновляем список после успешного подключения
+                            let hwnd_list = unsafe { GetDlgItem(hwnd, 100) };
+                            populate_usb_list(hwnd_list, hwnd);
                         }
                     }
                 }
@@ -181,6 +201,10 @@ unsafe extern "system" fn wnd_proc(
                         let result = run_usbipd_command(&format!("usbipd detach --busid {}", bus_id));
                         if let Err(err) = result {
                             show_error(hwnd, &format!("Ошибка отключения: {}", err));
+                        } else {
+                            // Обновляем список после успешного отключения
+                            let hwnd_list = unsafe { GetDlgItem(hwnd, 100) };
+                            populate_usb_list(hwnd_list, hwnd);
                         }
                     }
                 }
@@ -233,7 +257,7 @@ fn populate_usb_list(hwnd_list: HWND, hwnd: HWND) {
             let parts: Vec<&str> = line.split_whitespace().collect();
             if parts.len() >= 4 {
                 let bus_id = parts[0]; // BUSID, например "1-6"
-                // Собираем DEVICE до слова "Not" или конца строки
+                // Собираем DEVICE до слова "Not" или "Attached"
                 let mut device_name = String::new();
                 let mut i = 2; // Начинаем с DEVICE (после BUSID и VID:PID)
                 while i < parts.len() && parts[i] != "Not" && parts[i] != "Attached" {
@@ -285,6 +309,62 @@ fn get_selected_device(hwnd: HWND, list_id: i32) -> Option<String> {
             }
         }
         None
+    }
+}
+
+fn check_device_state(bus_id: &str) -> Option<String> {
+    let output = Command::new("usbipd").arg("list").output().ok()?;
+    let output_str = str::from_utf8(&output.stdout).ok()?;
+    
+    let mut lines = output_str.lines().skip(2);
+    while let Some(line) = lines.next() {
+        if line.is_empty() || line.contains("Persisted:") {
+            break;
+        }
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() >= 4 && parts[0] == bus_id {
+            let mut i = 2;
+            while i < parts.len() && parts[i] != "Not" && parts[i] != "Attached" {
+                i += 1;
+            }
+            if i < parts.len() {
+                return Some(parts[i].to_string());
+            }
+        }
+    }
+    None
+}
+
+fn run_usbipd_bind_with_admin(bus_id: &str, hwnd: HWND) -> Result<(), String> {
+    let verb: Vec<u16> = OsStr::new("runas")
+        .encode_wide()
+        .chain(once(0))
+        .collect();
+    let file: Vec<u16> = OsStr::new("cmd.exe")
+        .encode_wide()
+        .chain(once(0))
+        .collect();
+    let params: Vec<u16> = OsStr::new(&format!("/C usbipd bind --busid {}", bus_id))
+        .encode_wide()
+        .chain(once(0))
+        .collect();
+
+    let result = unsafe {
+        ShellExecuteW(
+            hwnd,
+            verb.as_ptr(),
+            file.as_ptr(),
+            params.as_ptr(),
+            ptr::null(),
+            SW_SHOW,
+        )
+    };
+
+    if result as i32 > 32 {
+        // Успешный запуск (значение > 32 означает успех)
+        Ok(())
+    } else {
+        Err(format!("Не удалось запустить usbipd bind с правами администратора (код ошибки: {})", result))
     }
 }
 
