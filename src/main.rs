@@ -7,12 +7,12 @@ use winapi::um::winuser::{
     PostQuitMessage, RegisterClassW, SendMessageW, ShowWindow, TranslateMessage, BS_DEFPUSHBUTTON,
     CS_HREDRAW, CS_VREDRAW, IDC_ARROW, LBS_NOTIFY, LB_ADDSTRING, LB_GETCURSEL, LB_GETTEXT,
     LB_RESETCONTENT, MSG, SW_SHOW, WM_COMMAND, WM_DESTROY, WNDCLASSW, WS_CHILD,
-    WS_OVERLAPPEDWINDOW, WS_VISIBLE, WS_VSCROLL,
+    WS_OVERLAPPEDWINDOW, WS_VISIBLE, WS_VSCROLL, MessageBoxW, MB_OK, MB_ICONERROR,
 };
 use std::ffi::OsStr;
 use std::iter::once;
 use std::os::windows::ffi::OsStrExt;
-use std::process::Command;
+use std::process::{Command, Output};
 use std::ptr;
 use std::str;
 
@@ -140,7 +140,7 @@ fn main() {
         );
 
         // Заполнение списка устройств
-        populate_usb_list(hwnd_list);
+        populate_usb_list(hwnd_list, hwnd);
 
         // Показ окна
         ShowWindow(hwnd, SW_SHOW);
@@ -168,14 +168,20 @@ unsafe extern "system" fn wnd_proc(
                     // Кнопка "Attach"
                     let selected = get_selected_device(hwnd, 100);
                     if let Some(bus_id) = selected {
-                        run_usbipd_command(&format!("usbipd attach --wsl --busid {}", bus_id));
+                        let result = run_usbipd_command(&format!("usbipd attach --wsl --busid {}", bus_id));
+                        if let Err(err) = result {
+                            show_error(hwnd, &format!("Ошибка подключения: {}", err));
+                        }
                     }
                 }
                 102 => {
                     // Кнопка "Detach"
                     let selected = get_selected_device(hwnd, 100);
                     if let Some(bus_id) = selected {
-                        run_usbipd_command(&format!("usbipd detach --busid {}", bus_id));
+                        let result = run_usbipd_command(&format!("usbipd detach --busid {}", bus_id));
+                        if let Err(err) = result {
+                            show_error(hwnd, &format!("Ошибка отключения: {}", err));
+                        }
                     }
                 }
                 _ => {}
@@ -192,7 +198,7 @@ unsafe extern "system" fn wnd_proc(
     }
 }
 
-fn populate_usb_list(hwnd_list: HWND) {
+fn populate_usb_list(hwnd_list: HWND, hwnd: HWND) {
     unsafe {
         // Очистка списка
         SendMessageW(hwnd_list, LB_RESETCONTENT, 0, 0);
@@ -202,6 +208,7 @@ fn populate_usb_list(hwnd_list: HWND) {
             Ok(output) => output,
             Err(e) => {
                 println!("Ошибка выполнения usbipd list: {}", e);
+                show_error(hwnd, &format!("Ошибка выполнения usbipd list: {}", e));
                 return;
             }
         };
@@ -210,6 +217,7 @@ fn populate_usb_list(hwnd_list: HWND) {
             Ok(s) => s,
             Err(e) => {
                 println!("Ошибка декодирования вывода usbipd: {}", e);
+                show_error(hwnd, &format!("Ошибка декодирования вывода: {}", e));
                 return;
             }
         };
@@ -228,15 +236,88 @@ fn populate_usb_list(hwnd_list: HWND) {
                 // Собираем DEVICE до слова "Not" или конца строки
                 let mut device_name = String::new();
                 let mut i = 2; // Начинаем с DEVICE (после BUSID и VID:PID)
-                while i < parts.len() && parts[i] != "Not" {
+                while i < parts.len() && parts[i] != "Not" && parts[i] != "Attached" {
                     if !device_name.is_empty() {
                         device_name.push(' ');
                     }
                     device_name.push_str(parts[i]);
                     i += 1;
                 }
-                let display = format!("{}: {}", bus_id, device_name);
+                let state = if i < parts.len() { parts[i] } else { "Unknown" };
+                let display = format!("{}: {} [{}]", bus_id, device_name, state);
                 let display_w: Vec<u16> = OsStr::new(&display)
                     .encode_wide()
                     .chain(once(0))
-                    .
+                    .collect();
+                let result = SendMessageW(hwnd_list, LB_ADDSTRING, 0, display_w.as_ptr() as LPARAM);
+                if result == -1 {
+                    println!("Ошибка добавления строки: {} (hwnd_list: {:p})", display, hwnd_list);
+                } else {
+                    println!("Добавлено: {} (индекс: {})", display, result);
+                }
+            } else {
+                println!("Некорректная строка: {}", line);
+            }
+        }
+    }
+}
+
+fn get_selected_device(hwnd: HWND, list_id: i32) -> Option<String> {
+    unsafe {
+        let hwnd_list = GetDlgItem(hwnd, list_id);
+        if hwnd_list.is_null() {
+            return None;
+        }
+        let index = SendMessageW(hwnd_list, LB_GETCURSEL, 0, 0);
+        if index != -1 {
+            let mut buffer: [u16; 256] = [0; 256];
+            let len = SendMessageW(
+                hwnd_list,
+                LB_GETTEXT,
+                index as WPARAM,
+                buffer.as_mut_ptr() as LPARAM,
+            );
+            if len > 0 {
+                let text = String::from_utf16_lossy(&buffer[..len as usize]);
+                if let Some(bus_id) = text.splitn(2, ": ").next() {
+                    return Some(bus_id.to_string());
+                }
+            }
+        }
+        None
+    }
+}
+
+fn run_usbipd_command(command: &str) -> Result<(), String> {
+    let parts: Vec<&str> = command.split_whitespace().collect();
+    if let Some((cmd, args)) = parts.split_first() {
+        let output: Output = Command::new(cmd)
+            .args(args)
+            .output()
+            .map_err(|e| format!("Не удалось выполнить команду: {}", e))?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            let stderr = str::from_utf8(&output.stderr)
+                .unwrap_or("Неизвестная ошибка")
+                .to_string();
+            Err(stderr)
+        }
+    } else {
+        Err("Неверная команда".to_string())
+    }
+}
+
+fn show_error(hwnd: HWND, message: &str) {
+    let title: Vec<u16> = OsStr::new("Ошибка")
+        .encode_wide()
+        .chain(once(0))
+        .collect();
+    let message_w: Vec<u16> = OsStr::new(message)
+        .encode_wide()
+        .chain(once(0))
+        .collect();
+    unsafe {
+        MessageBoxW(hwnd, message_w.as_ptr(), title.as_ptr(), MB_OK | MB_ICONERROR);
+    }
+}
