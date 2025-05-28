@@ -86,6 +86,10 @@ fn main() {
             h_instance,
             ptr::null_mut(),
         );
+        if hwnd_list.is_null() {
+            println!("Ошибка создания ListBox");
+            ExitProcess(1);
+        }
 
         // Кнопка "Attach"
         CreateWindowExW(
@@ -194,70 +198,45 @@ fn populate_usb_list(hwnd_list: HWND) {
         SendMessageW(hwnd_list, LB_RESETCONTENT, 0, 0);
 
         // Выполнение команды usbipd list
-        let output = Command::new("usbipd")
-            .arg("list")
-            .output()
-            .expect("Не удалось выполнить usbipd list");
+        let output = match Command::new("usbipd").arg("list").output() {
+            Ok(output) => output,
+            Err(e) => {
+                println!("Ошибка выполнения usbipd list: {}", e);
+                return;
+            }
+        };
 
-        let output_str = str::from_utf8(&output.stdout).expect("Невалидный UTF-8 вывод");
+        let output_str = match str::from_utf8(&output.stdout) {
+            Ok(s) => s,
+            Err(e) => {
+                println!("Ошибка декодирования вывода usbipd: {}", e);
+                return;
+            }
+        };
         println!("Вывод usbipd list: {}", output_str); // Отладочный вывод
 
-        // Парсинг вывода и добавление в список
-        for line in output_str.lines() {
-            if line.contains(" - ") {
-                let parts: Vec<&str> = line.splitn(2, " - ").collect();
-                if parts.len() == 2 {
-                    let bus_id = parts[0].trim();
-                    let device_name = parts[1].trim();
-                    let display = format!("{}: {}", bus_id, device_name);
-                    let display_w: Vec<u16> = OsStr::new(&display)
-                        .encode_wide()
-                        .chain(once(0))
-                        .collect();
-                    let result = SendMessageW(hwnd_list, LB_ADDSTRING, 0, display_w.as_ptr() as LPARAM);
-                    if result == -1 {
-                        println!("Ошибка добавления строки: {}", display); // Отладка
+        // Пропускаем заголовок
+        let mut lines = output_str.lines().skip(2); // Пропускаем "Connected:" и заголовок таблицы
+        while let Some(line) = lines.next() {
+            if line.is_empty() || line.contains("Persisted:") {
+                break; // Прерываем, если дошли до секции Persisted
+            }
+            // Разделяем строку по пробелам/табам, убираем лишние пробелы
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 4 {
+                let bus_id = parts[0]; // BUSID, например "1-6"
+                // Собираем DEVICE до слова "Not" или конца строки
+                let mut device_name = String::new();
+                let mut i = 2; // Начинаем с DEVICE (после BUSID и VID:PID)
+                while i < parts.len() && parts[i] != "Not" {
+                    if !device_name.is_empty() {
+                        device_name.push(' ');
                     }
-                } else {
-                    println!("Некорректная строка: {}", line); // Отладка
+                    device_name.push_str(parts[i]);
+                    i += 1;
                 }
-            }
-        }
-    }
-}
-
-fn get_selected_device(hwnd: HWND, list_id: i32) -> Option<String> {
-    unsafe {
-        let hwnd_list = GetDlgItem(hwnd, list_id);
-        if hwnd_list.is_null() {
-            return None;
-        }
-        let index = SendMessageW(hwnd_list, LB_GETCURSEL, 0, 0);
-        if index != -1 {
-            let mut buffer: [u16; 256] = [0; 256];
-            let len = SendMessageW(
-                hwnd_list,
-                LB_GETTEXT,
-                index as WPARAM,
-                buffer.as_mut_ptr() as LPARAM,
-            );
-            if len > 0 {
-                let text = String::from_utf16_lossy(&buffer[..len as usize]);
-                if let Some(bus_id) = text.splitn(2, ": ").next() {
-                    return Some(bus_id.to_string());
-                }
-            }
-        }
-        None
-    }
-}
-
-fn run_usbipd_command(command: &str) {
-    let parts: Vec<&str> = command.split_whitespace().collect();
-    if let Some((cmd, args)) = parts.split_first() {
-        Command::new(cmd)
-            .args(args)
-            .spawn()
-            .expect("Не удалось выполнить usbipd команду");
-    }
-}
+                let display = format!("{}: {}", bus_id, device_name);
+                let display_w: Vec<u16> = OsStr::new(&display)
+                    .encode_wide()
+                    .chain(once(0))
+                    .
