@@ -389,8 +389,8 @@ unsafe extern "system" fn wnd_proc(
                 }
                 _ => {}
             }
-            // Возвращаем указатель обратно
-            Box::into_raw(state);
+            // Игнорируем возвращаемое значение, чтобы избежать предупреждения
+            let _ = Box::into_raw(state);
             0
         }
         WM_DESTROY => {
