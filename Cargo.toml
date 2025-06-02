@@ -1,7 +1,10 @@
 [package]
 name = "usbipd_gui"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
-winapi = { version = "0.3", features = ["winuser", "libloaderapi", "processthreadsapi", "shellapi"] }
+winapi = { version = "0.3.9", features = ["winuser", "wingdi", "shellapi", "libloaderapi", "processthreadsapi", "dwmapi"] }
+wait-timeout = "0.2"
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
