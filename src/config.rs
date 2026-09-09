@@ -62,7 +62,9 @@ pub fn save_config(config: &Config) {
 fn decode_wsl_output(bytes: &[u8]) -> String {
     if bytes.len() >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE {
         let utf16: Vec<u16> = bytes[2..]
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
             .take_while(|&c| c != 0)
             .collect();
