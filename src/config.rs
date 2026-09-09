@@ -1,9 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::{Read, Write};
+use std::path::PathBuf;
 use std::process::Command;
-
-const CONFIG_PATH: &str = "config.json";
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -25,8 +24,19 @@ fn default_wsl_distro() -> String {
     detect_default_wsl_distro()
 }
 
+/// Prefer `config.json` next to the executable so Start Menu / explorer launches work.
+pub fn config_path() -> PathBuf {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            return dir.join("config.json");
+        }
+    }
+    PathBuf::from("config.json")
+}
+
 pub fn load_config() -> Config {
-    if let Ok(mut file) = File::open(CONFIG_PATH) {
+    let path = config_path();
+    if let Ok(mut file) = File::open(&path) {
         let mut contents = String::new();
         if file.read_to_string(&mut contents).is_ok() {
             if let Ok(mut config) = serde_json::from_str::<Config>(&contents) {
@@ -41,7 +51,8 @@ pub fn load_config() -> Config {
 }
 
 pub fn save_config(config: &Config) {
-    if let Ok(mut file) = File::create(CONFIG_PATH) {
+    let path = config_path();
+    if let Ok(mut file) = File::create(&path) {
         if let Ok(json) = serde_json::to_string_pretty(config) {
             let _ = file.write_all(json.as_bytes());
         }
@@ -90,5 +101,13 @@ mod tests {
     fn default_config_has_wsl_distro() {
         let config = Config::default();
         assert!(!config.wsl_distro.is_empty());
+    }
+
+    #[test]
+    fn config_path_ends_with_config_json() {
+        assert_eq!(
+            config_path().file_name().and_then(|s| s.to_str()),
+            Some("config.json")
+        );
     }
 }
