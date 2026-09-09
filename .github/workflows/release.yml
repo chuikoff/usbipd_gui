@@ -1,0 +1,31 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build release
+        run: cargo build --release
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: target/release/usbipd_gui.exe
+          name: ${{ github.ref_name }}
+          body: |
+            USBIPD Manager ${{ github.ref_name }}
+
+            - Безопаснее AppState (без re-entrancy / double-free)
+            - Валидация bus id и WSL-дистрибутива, elevated без shell-склейки
+            - Auto-Attach через Job Object (KILL_ON_JOB_CLOSE)
+            - config.json рядом с exe
+            - Адаптивный layout при ресайзе
