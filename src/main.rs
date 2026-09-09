@@ -5,68 +5,109 @@ use config::{load_config, save_config, Config};
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::iter::once;
+use std::mem;
 use std::os::windows::ffi::OsStrExt;
-use std::process::{Child, Command};
+use std::os::windows::io::AsRawHandle;
+use std::process::Child;
 use std::ptr;
 use std::thread;
 use std::time::{Duration, Instant};
 use usbipd::{
-    attach_auto_command, extract_bus_id, extract_state_from_display, fetch_usb_devices,
-    format_device_display, is_auto_attachable_state, is_bindable_state, is_unbindable_state,
-    run_usbipd_attach, run_usbipd_bind, run_usbipd_detach, run_usbipd_unbind,
+    extract_bus_id, extract_state_from_display, fetch_usb_devices, format_device_display,
+    is_auto_attachable_state, is_bindable_state, is_unbindable_state, run_usbipd_attach,
+    run_usbipd_bind, run_usbipd_detach, run_usbipd_unbind, spawn_auto_attach, validate_wsl_distro,
 };
+use winapi::ctypes::c_void;
 use winapi::shared::minwindef::{LPARAM, LRESULT, UINT, WPARAM};
 use winapi::shared::windef::{HFONT, HMENU, HWND};
+use winapi::um::handleapi::{CloseHandle, INVALID_HANDLE_VALUE};
+use winapi::um::jobapi2::{AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject};
 use winapi::um::libloaderapi::GetModuleHandleW;
 use winapi::um::processthreadsapi::ExitProcess;
 use winapi::um::wingdi::{GetStockObject, DEFAULT_GUI_FONT};
-use winapi::um::winuser::{
-    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetDlgItem, GetMessageW, GetWindowLongPtrW,
-    InvalidateRect, LoadCursorW, LoadIconW, MessageBoxW, PeekMessageW, PostQuitMessage,
-    RegisterClassW, SendMessageW, SetWindowLongPtrW, ShowWindow, TranslateMessage, UpdateWindow,
-    BS_DEFPUSHBUTTON, COLOR_WINDOW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, IDC_ARROW,
-    IDI_APPLICATION, LBS_HASSTRINGS, LBS_NOTIFY, LB_ADDSTRING, LB_GETCOUNT, LB_GETCURSEL,
-    LB_GETTEXT, LB_RESETCONTENT, MB_ICONERROR, MB_OK, MSG, PM_REMOVE, SS_LEFT, SW_SHOW, WM_COMMAND,
-    WM_DESTROY, WM_SETFONT, WNDCLASSW, WS_CHILD, WS_CLIPCHILDREN, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
-    WS_VSCROLL,
+use winapi::um::winnt::{
+    JobObjectExtendedLimitInformation, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
+use winapi::um::winuser::{
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect, GetDlgItem,
+    GetMessageW, GetWindowLongPtrW, InvalidateRect, LoadCursorW, LoadIconW, MessageBoxW,
+    MoveWindow, PostQuitMessage, RegisterClassW, SendMessageW, SetWindowLongPtrW, ShowWindow,
+    TranslateMessage, UpdateWindow, BS_DEFPUSHBUTTON, BS_PUSHBUTTON, COLOR_WINDOW, CS_HREDRAW,
+    CS_VREDRAW, CW_USEDEFAULT, IDC_ARROW, IDI_APPLICATION, LBS_HASSTRINGS, LBS_NOTIFY,
+    LB_ADDSTRING, LB_GETCURSEL, LB_GETTEXT, LB_RESETCONTENT, MB_ICONERROR, MB_OK, MSG, SS_LEFT,
+    SW_SHOW, WM_COMMAND, WM_DESTROY, WM_SETFONT, WM_SIZE, WNDCLASSW, WS_CHILD, WS_CLIPCHILDREN,
+    WS_OVERLAPPEDWINDOW, WS_VISIBLE, WS_VSCROLL,
+};
+
+const ID_LIST: i32 = 100;
+const ID_BIND: i32 = 101;
+const ID_UNBIND: i32 = 102;
+const ID_ATTACH: i32 = 103;
+const ID_DETACH: i32 = 104;
+const ID_AUTO_ATTACH: i32 = 105;
+const ID_REFRESH: i32 = 106;
+const ID_STOP_AUTO: i32 = 107;
+const ID_STATIC: i32 = 200;
 
 struct AppState {
     auto_attach_processes: HashMap<String, Child>,
     config: Config,
+    job: winapi::um::winnt::HANDLE,
 }
 
 impl AppState {
     fn new() -> Self {
+        let job = unsafe { create_kill_on_close_job() };
         Self {
             auto_attach_processes: HashMap::new(),
             config: load_config(),
+            job,
         }
     }
 
     fn restore_auto_attach(&mut self, hwnd: HWND) {
-        let devices: Vec<String> = self.config.auto_attach_devices.clone();
-        for bus_id in devices {
-            self.start_auto_attach(&bus_id, hwnd);
-        }
-    }
-
-    fn start_auto_attach(&mut self, bus_id: &str, hwnd: HWND) {
-        if self.auto_attach_processes.contains_key(bus_id) {
-            println!("Auto-Attach уже запущен для устройства {bus_id}");
+        if let Err(err) = validate_wsl_distro(&self.config.wsl_distro) {
+            show_error(hwnd, &err);
+            self.config.auto_attach_devices.clear();
+            save_config(&self.config);
             return;
         }
 
-        let command = attach_auto_command(bus_id, &self.config.wsl_distro);
-        println!("Запуск Auto-Attach для устройства {bus_id}: {command}");
+        let devices: Vec<String> = self.config.auto_attach_devices.clone();
+        let mut failed = Vec::new();
+        for bus_id in devices {
+            if self.start_auto_attach(&bus_id, hwnd).is_err() {
+                failed.push(bus_id);
+            }
+        }
+        if !failed.is_empty() {
+            self.config
+                .auto_attach_devices
+                .retain(|id| !failed.contains(id));
+            save_config(&self.config);
+        }
+    }
 
-        match Command::new("cmd")
-            .args(["/C", &command])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-        {
+    fn start_auto_attach(&mut self, bus_id: &str, hwnd: HWND) -> Result<(), ()> {
+        if self.auto_attach_processes.contains_key(bus_id) {
+            println!("Auto-Attach уже запущен для устройства {bus_id}");
+            return Ok(());
+        }
+
+        match spawn_auto_attach(bus_id, &self.config.wsl_distro) {
             Ok(child) => {
+                if !self.job.is_null() && self.job != INVALID_HANDLE_VALUE {
+                    let handle = child.as_raw_handle();
+                    unsafe {
+                        if AssignProcessToJobObject(self.job, handle as *mut c_void) == 0 {
+                            println!(
+                                "Не удалось добавить процесс Auto-Attach в Job Object для {bus_id}"
+                            );
+                        }
+                    }
+                }
+
                 self.auto_attach_processes.insert(bus_id.to_string(), child);
                 if !self
                     .config
@@ -76,10 +117,12 @@ impl AppState {
                     self.config.auto_attach_devices.push(bus_id.to_string());
                     save_config(&self.config);
                 }
+                Ok(())
             }
             Err(e) => {
                 println!("Ошибка запуска Auto-Attach для {bus_id}: {e}");
                 show_error(hwnd, &format!("Ошибка запуска Auto-Attach: {e}"));
+                Err(())
             }
         }
     }
@@ -100,15 +143,40 @@ impl AppState {
             let _ = child.wait();
         }
         save_config(&self.config);
+        unsafe {
+            if !self.job.is_null() && self.job != INVALID_HANDLE_VALUE {
+                // KILL_ON_JOB_CLOSE terminates any remaining tree members.
+                CloseHandle(self.job);
+                self.job = ptr::null_mut();
+            }
+        }
     }
+}
+
+unsafe fn create_kill_on_close_job() -> winapi::um::winnt::HANDLE {
+    let job = CreateJobObjectW(ptr::null_mut(), ptr::null());
+    if job.is_null() {
+        return ptr::null_mut();
+    }
+
+    let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = mem::zeroed();
+    info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    let ok = SetInformationJobObject(
+        job,
+        JobObjectExtendedLimitInformation,
+        &mut info as *mut _ as *mut c_void,
+        mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+    );
+    if ok == 0 {
+        CloseHandle(job);
+        return ptr::null_mut();
+    }
+    job
 }
 
 fn main() {
     unsafe {
-        let class_name: Vec<u16> = OsStr::new("USBIPD_GUI")
-            .encode_wide()
-            .chain(once(0))
-            .collect();
+        let class_name: Vec<u16> = wide("USBIPD_GUI");
         let h_instance = GetModuleHandleW(ptr::null());
         let h_icon = LoadIconW(ptr::null_mut(), IDI_APPLICATION);
         let wc = WNDCLASSW {
@@ -130,14 +198,11 @@ fn main() {
         let state = Box::new(AppState::new());
         let state_ptr = Box::into_raw(state);
 
+        let title = wide("USBIPD Manager");
         let hwnd = CreateWindowExW(
             0,
             class_name.as_ptr(),
-            OsStr::new("USBIPD Manager")
-                .encode_wide()
-                .chain(once(0))
-                .collect::<Vec<u16>>()
-                .as_ptr(),
+            title.as_ptr(),
             WS_OVERLAPPEDWINDOW | WS_VISIBLE | WS_CLIPCHILDREN,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
@@ -155,13 +220,10 @@ fn main() {
 
         SetWindowLongPtrW(hwnd, winapi::um::winuser::GWLP_USERDATA, state_ptr as isize);
 
+        let list_class = wide("LISTBOX");
         let hwnd_list = CreateWindowExW(
             0,
-            OsStr::new("LISTBOX")
-                .encode_wide()
-                .chain(once(0))
-                .collect::<Vec<u16>>()
-                .as_ptr(),
+            list_class.as_ptr(),
             ptr::null(),
             WS_CHILD | WS_VISIBLE | WS_VSCROLL | LBS_NOTIFY | LBS_HASSTRINGS,
             10,
@@ -169,33 +231,29 @@ fn main() {
             760,
             480,
             hwnd,
-            100 as HMENU,
+            ID_LIST as HMENU,
             h_instance,
             ptr::null_mut(),
         );
         if hwnd_list.is_null() {
+            SetWindowLongPtrW(hwnd, winapi::um::winuser::GWLP_USERDATA, 0);
             let _ = Box::from_raw(state_ptr);
+            DestroyWindow(hwnd);
             ExitProcess(1);
         }
 
         let font: HFONT = GetStockObject(DEFAULT_GUI_FONT.try_into().unwrap()) as HFONT;
         SendMessageW(hwnd_list, WM_SETFONT, font as WPARAM, 1 as LPARAM);
 
-        let warning_text = OsStr::new(
+        let warning_text = wide(
             "Примечание: USBdk или VPN могут повлиять на работу usbipd.\r\n\
              Рекомендуется отключить их при проблемах.\r\n\
-             WSL-дистрибутив настраивается в config.json (поле wsl_distro).",
-        )
-        .encode_wide()
-        .chain(once(0))
-        .collect::<Vec<u16>>();
+             WSL-дистрибутив настраивается в config.json рядом с exe (поле wsl_distro).",
+        );
+        let static_class = wide("STATIC");
         let hwnd_static = CreateWindowExW(
             0,
-            OsStr::new("STATIC")
-                .encode_wide()
-                .chain(once(0))
-                .collect::<Vec<u16>>()
-                .as_ptr(),
+            static_class.as_ptr(),
             warning_text.as_ptr(),
             WS_CHILD | WS_VISIBLE | SS_LEFT,
             10,
@@ -203,40 +261,49 @@ fn main() {
             760,
             55,
             hwnd,
-            200 as HMENU,
+            ID_STATIC as HMENU,
             h_instance,
             ptr::null_mut(),
         );
         SendMessageW(hwnd_static, WM_SETFONT, font as WPARAM, 1 as LPARAM);
 
-        for (label, id, x, y, w, h) in [
-            ("Bind", 101, 10, 565, 100, 40),
-            ("Unbind", 102, 120, 565, 100, 40),
-            ("Attach", 103, 230, 565, 100, 40),
-            ("Detach", 104, 340, 565, 100, 40),
-            ("Auto Attach", 105, 10, 615, 130, 40),
-            ("Stop Auto-Attach", 107, 150, 615, 150, 40),
-            ("Обновить", 106, 310, 615, 100, 40),
+        for (label, id, style) in [
+            ("Bind", ID_BIND, BS_DEFPUSHBUTTON),
+            ("Unbind", ID_UNBIND, BS_PUSHBUTTON),
+            ("Attach", ID_ATTACH, BS_PUSHBUTTON),
+            ("Detach", ID_DETACH, BS_PUSHBUTTON),
+            ("Auto Attach", ID_AUTO_ATTACH, BS_PUSHBUTTON),
+            ("Stop Auto-Attach", ID_STOP_AUTO, BS_PUSHBUTTON),
+            ("Обновить", ID_REFRESH, BS_PUSHBUTTON),
         ] {
-            create_button(hwnd, h_instance, label, id, x, y, w, h);
+            create_button(hwnd, h_instance, label, id, style);
         }
 
-        for id in 101..=107 {
+        for id in [
+            ID_BIND,
+            ID_UNBIND,
+            ID_ATTACH,
+            ID_DETACH,
+            ID_AUTO_ATTACH,
+            ID_STOP_AUTO,
+            ID_REFRESH,
+        ] {
             let hwnd_button = GetDlgItem(hwnd, id);
             SendMessageW(hwnd_button, WM_SETFONT, font as WPARAM, 1 as LPARAM);
         }
 
+        layout_controls(hwnd);
+
         {
             let state = &mut *state_ptr;
             state.restore_auto_attach(hwnd);
+            populate_usb_list(hwnd_list, hwnd, &state.config.auto_attach_devices);
         }
-
-        populate_usb_list(hwnd_list, hwnd);
 
         ShowWindow(hwnd, SW_SHOW);
         UpdateWindow(hwnd);
 
-        let mut msg: MSG = std::mem::zeroed();
+        let mut msg: MSG = mem::zeroed();
         while GetMessageW(&mut msg, ptr::null_mut(), 0, 0) > 0 {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
@@ -244,39 +311,80 @@ fn main() {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+fn wide(s: &str) -> Vec<u16> {
+    OsStr::new(s).encode_wide().chain(once(0)).collect()
+}
+
 unsafe fn create_button(
     parent: HWND,
     h_instance: winapi::shared::minwindef::HINSTANCE,
     label: &str,
     id: i32,
-    x: i32,
-    y: i32,
-    width: i32,
-    height: i32,
+    style: u32,
 ) {
+    let class = wide("BUTTON");
+    let text = wide(label);
     CreateWindowExW(
         0,
-        OsStr::new("BUTTON")
-            .encode_wide()
-            .chain(once(0))
-            .collect::<Vec<u16>>()
-            .as_ptr(),
-        OsStr::new(label)
-            .encode_wide()
-            .chain(once(0))
-            .collect::<Vec<u16>>()
-            .as_ptr(),
-        WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
-        x,
-        y,
-        width,
-        height,
+        class.as_ptr(),
+        text.as_ptr(),
+        WS_CHILD | WS_VISIBLE | style,
+        0,
+        0,
+        100,
+        40,
         parent,
         id as HMENU,
         h_instance,
         ptr::null_mut(),
     );
+}
+
+unsafe fn layout_controls(hwnd: HWND) {
+    let mut rect = mem::zeroed();
+    GetClientRect(hwnd, &mut rect);
+    let width = rect.right - rect.left;
+    let height = rect.bottom - rect.top;
+    if width <= 0 || height <= 0 {
+        return;
+    }
+
+    let margin = 10;
+    let button_h = 40;
+    let button_row_gap = 10;
+    let static_h = 55;
+    let bottom_block = button_h * 2 + button_row_gap + static_h + margin * 3;
+    let list_h = (height - bottom_block - margin).max(80);
+    let list_w = (width - margin * 2).max(100);
+
+    let hwnd_list = GetDlgItem(hwnd, ID_LIST);
+    MoveWindow(hwnd_list, margin, margin, list_w, list_h, 1);
+
+    let static_y = margin + list_h + margin;
+    let hwnd_static = GetDlgItem(hwnd, ID_STATIC);
+    MoveWindow(hwnd_static, margin, static_y, list_w, static_h, 1);
+
+    let row1_y = static_y + static_h + margin;
+    let row2_y = row1_y + button_h + button_row_gap;
+    let btn_w = 100;
+    let gap = 10;
+
+    let row1 = [(ID_BIND, 0), (ID_UNBIND, 1), (ID_ATTACH, 2), (ID_DETACH, 3)];
+    for (id, idx) in row1 {
+        let x = margin + idx * (btn_w + gap);
+        MoveWindow(GetDlgItem(hwnd, id), x, row1_y, btn_w, button_h, 1);
+    }
+
+    let row2 = [
+        (ID_AUTO_ATTACH, 130),
+        (ID_STOP_AUTO, 150),
+        (ID_REFRESH, 100),
+    ];
+    let mut x = margin;
+    for (id, w) in row2 {
+        MoveWindow(GetDlgItem(hwnd, id), x, row2_y, w, button_h, 1);
+        x += w + gap;
+    }
 }
 
 unsafe extern "system" fn wnd_proc(
@@ -286,33 +394,37 @@ unsafe extern "system" fn wnd_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     match msg {
+        WM_SIZE => {
+            layout_controls(hwnd);
+            0
+        }
         WM_COMMAND => {
             let state_ptr =
                 GetWindowLongPtrW(hwnd, winapi::um::winuser::GWLP_USERDATA) as *mut AppState;
             if state_ptr.is_null() {
                 return DefWindowProcW(hwnd, msg, wparam, lparam);
             }
-            let mut state = Box::from_raw(state_ptr);
-            let control_id = (wparam & 0xFFFF) as u16;
-            let hwnd_list = GetDlgItem(hwnd, 100);
+            // Borrow in place — do NOT Box::from_raw (re-entrancy / double-free risk).
+            let state = &mut *state_ptr;
+            let control_id = (wparam & 0xFFFF) as i32;
+            let hwnd_list = GetDlgItem(hwnd, ID_LIST);
 
             match control_id {
-                101 => handle_bind(hwnd, hwnd_list),
-                102 => handle_unbind(hwnd, hwnd_list, &mut state),
-                103 => handle_attach(hwnd, hwnd_list, &state),
-                104 => handle_detach(hwnd, hwnd_list),
-                105 => handle_auto_attach(hwnd, hwnd_list, &mut state),
-                107 => handle_stop_auto_attach(hwnd, hwnd_list, &mut state),
-                106 => populate_usb_list(hwnd_list, hwnd),
+                ID_BIND => handle_bind(hwnd, hwnd_list, state),
+                ID_UNBIND => handle_unbind(hwnd, hwnd_list, state),
+                ID_ATTACH => handle_attach(hwnd, hwnd_list, state),
+                ID_DETACH => handle_detach(hwnd, hwnd_list, state),
+                ID_AUTO_ATTACH => handle_auto_attach(hwnd, hwnd_list, state),
+                ID_STOP_AUTO => handle_stop_auto_attach(hwnd, hwnd_list, state),
+                ID_REFRESH => populate_usb_list(hwnd_list, hwnd, &state.config.auto_attach_devices),
                 _ => {}
             }
-
-            let _ = Box::into_raw(state);
             0
         }
         WM_DESTROY => {
             let state_ptr =
                 GetWindowLongPtrW(hwnd, winapi::um::winuser::GWLP_USERDATA) as *mut AppState;
+            SetWindowLongPtrW(hwnd, winapi::um::winuser::GWLP_USERDATA, 0);
             if !state_ptr.is_null() {
                 let mut state = Box::from_raw(state_ptr);
                 state.shutdown_auto_attach_processes();
@@ -324,7 +436,7 @@ unsafe extern "system" fn wnd_proc(
     }
 }
 
-fn handle_bind(hwnd: HWND, hwnd_list: HWND) {
+fn handle_bind(hwnd: HWND, hwnd_list: HWND, state: &AppState) {
     let Some(bus_id) = get_selected_device(hwnd_list) else {
         show_error(hwnd, "Устройство не выбрано");
         return;
@@ -339,8 +451,8 @@ fn handle_bind(hwnd: HWND, hwnd_list: HWND) {
     println!("Попытка выполнить bind для bus_id: {bus_id}");
     match run_usbipd_bind(&bus_id) {
         Ok(()) => {
-            wait_for_device_state(hwnd, &bus_id, |state| !is_bindable_state(state));
-            populate_usb_list(hwnd_list, hwnd);
+            wait_for_device_state(&bus_id, |s| !is_bindable_state(s));
+            populate_usb_list(hwnd_list, hwnd, &state.config.auto_attach_devices);
         }
         Err(err) => {
             println!("Ошибка bind для bus_id {bus_id}: {err}");
@@ -367,8 +479,8 @@ fn handle_unbind(hwnd: HWND, hwnd_list: HWND, state: &mut AppState) {
     state.stop_auto_attach(&bus_id);
     match run_usbipd_unbind(&bus_id) {
         Ok(()) => {
-            wait_for_device_state(hwnd, &bus_id, is_bindable_state);
-            populate_usb_list(hwnd_list, hwnd);
+            wait_for_device_state(&bus_id, is_bindable_state);
+            populate_usb_list(hwnd_list, hwnd, &state.config.auto_attach_devices);
         }
         Err(err) => {
             println!("Ошибка unbind для bus_id {bus_id}: {err}");
@@ -388,7 +500,7 @@ fn handle_attach(hwnd: HWND, hwnd_list: HWND, state: &AppState) {
         state.config.wsl_distro
     );
     match run_usbipd_attach(&bus_id, &state.config.wsl_distro) {
-        Ok(()) => populate_usb_list(hwnd_list, hwnd),
+        Ok(()) => populate_usb_list(hwnd_list, hwnd, &state.config.auto_attach_devices),
         Err(err) => {
             println!("Ошибка attach: {err}");
             show_error(hwnd, &format!("Ошибка подключения: {err}"));
@@ -396,14 +508,14 @@ fn handle_attach(hwnd: HWND, hwnd_list: HWND, state: &AppState) {
     }
 }
 
-fn handle_detach(hwnd: HWND, hwnd_list: HWND) {
+fn handle_detach(hwnd: HWND, hwnd_list: HWND, state: &AppState) {
     let Some(bus_id) = get_selected_device(hwnd_list) else {
         show_error(hwnd, "Устройство не выбрано");
         return;
     };
 
     match run_usbipd_detach(&bus_id) {
-        Ok(()) => populate_usb_list(hwnd_list, hwnd),
+        Ok(()) => populate_usb_list(hwnd_list, hwnd, &state.config.auto_attach_devices),
         Err(err) => {
             println!("Ошибка detach: {err}");
             show_error(hwnd, &format!("Ошибка отключения: {err}"));
@@ -426,8 +538,8 @@ fn handle_auto_attach(hwnd: HWND, hwnd_list: HWND, state: &mut AppState) {
         return;
     }
 
-    state.start_auto_attach(&bus_id, hwnd);
-    populate_usb_list(hwnd_list, hwnd);
+    let _ = state.start_auto_attach(&bus_id, hwnd);
+    populate_usb_list(hwnd_list, hwnd, &state.config.auto_attach_devices);
 }
 
 fn handle_stop_auto_attach(hwnd: HWND, hwnd_list: HWND, state: &mut AppState) {
@@ -437,10 +549,11 @@ fn handle_stop_auto_attach(hwnd: HWND, hwnd_list: HWND, state: &mut AppState) {
     };
 
     state.stop_auto_attach(&bus_id);
-    populate_usb_list(hwnd_list, hwnd);
+    populate_usb_list(hwnd_list, hwnd, &state.config.auto_attach_devices);
 }
 
-fn wait_for_device_state(_hwnd: HWND, bus_id: &str, predicate: fn(&str) -> bool) {
+/// Poll without dispatching nested window messages (avoids re-entrant WM_COMMAND).
+fn wait_for_device_state(bus_id: &str, predicate: fn(&str) -> bool) {
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
         if let Ok(Some(state)) = usbipd::get_device_state(bus_id) {
@@ -448,34 +561,13 @@ fn wait_for_device_state(_hwnd: HWND, bus_id: &str, predicate: fn(&str) -> bool)
                 return;
             }
         }
-        pump_pending_messages();
         thread::sleep(Duration::from_millis(200));
     }
 }
 
-fn pump_pending_messages() {
-    unsafe {
-        let mut msg: MSG = std::mem::zeroed();
-        while PeekMessageW(&mut msg, ptr::null_mut(), 0, 0, PM_REMOVE) > 0 {
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-        }
-    }
-}
-
-fn populate_usb_list(hwnd_list: HWND, hwnd: HWND) {
+fn populate_usb_list(hwnd_list: HWND, hwnd: HWND, auto_attach_devices: &[String]) {
     unsafe {
         SendMessageW(hwnd_list, LB_RESETCONTENT, 0, 0);
-
-        let auto_attach_devices = {
-            let state_ptr =
-                GetWindowLongPtrW(hwnd, winapi::um::winuser::GWLP_USERDATA) as *const AppState;
-            if state_ptr.is_null() {
-                Vec::new()
-            } else {
-                (*state_ptr).config.auto_attach_devices.clone()
-            }
-        };
 
         let devices = match fetch_usb_devices() {
             Ok(devices) => devices,
@@ -489,14 +581,13 @@ fn populate_usb_list(hwnd_list: HWND, hwnd: HWND) {
         for device in devices {
             let auto_attach = auto_attach_devices.contains(&device.bus_id);
             let display = format_device_display(&device, auto_attach);
-            let display_w: Vec<u16> = OsStr::new(&display).encode_wide().chain(once(0)).collect();
+            let display_w = wide(&display);
             let result = SendMessageW(hwnd_list, LB_ADDSTRING, 0, display_w.as_ptr() as LPARAM);
             if result == -1 {
                 println!("Ошибка добавления строки: {display}");
             }
         }
 
-        let _ = SendMessageW(hwnd_list, LB_GETCOUNT, 0, 0);
         let _ = InvalidateRect(hwnd_list, ptr::null(), 1);
         UpdateWindow(hwnd_list);
     }
@@ -550,8 +641,8 @@ fn get_list_item_state(hwnd_list: HWND) -> Option<String> {
 }
 
 fn show_error(hwnd: HWND, message: &str) {
-    let title: Vec<u16> = OsStr::new("Ошибка").encode_wide().chain(once(0)).collect();
-    let message_w: Vec<u16> = OsStr::new(message).encode_wide().chain(once(0)).collect();
+    let title = wide("Ошибка");
+    let message_w = wide(message);
     unsafe {
         MessageBoxW(
             hwnd,

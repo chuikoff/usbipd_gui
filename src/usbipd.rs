@@ -11,6 +11,31 @@ pub struct UsbDevice {
     pub state: String,
 }
 
+pub fn validate_bus_id(bus_id: &str) -> Result<(), String> {
+    let parts: Vec<&str> = bus_id.split('-').collect();
+    if parts.len() != 2
+        || parts
+            .iter()
+            .any(|part| part.is_empty() || !part.chars().all(|c| c.is_ascii_digit()))
+    {
+        return Err(format!("Некорректный bus id: {bus_id}"));
+    }
+    Ok(())
+}
+
+pub fn validate_wsl_distro(name: &str) -> Result<(), String> {
+    if name.is_empty() || name.len() > 64 {
+        return Err("Некорректное имя WSL-дистрибутива".to_string());
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+    {
+        return Err(format!("Некорректное имя WSL-дистрибутива: {name}"));
+    }
+    Ok(())
+}
+
 pub fn parse_usbipd_list(output: &str) -> Vec<UsbDevice> {
     output
         .lines()
@@ -88,6 +113,7 @@ pub fn fetch_usb_devices() -> Result<Vec<UsbDevice>, String> {
 }
 
 pub fn get_device_state(bus_id: &str) -> Result<Option<String>, String> {
+    validate_bus_id(bus_id)?;
     Ok(fetch_usb_devices()?
         .into_iter()
         .find(|device| device.bus_id == bus_id)
@@ -118,9 +144,17 @@ pub fn run_usbipd_command(args: &[&str]) -> Result<(), String> {
     }
 }
 
-pub fn run_elevated_usbipd_command(command: &str) -> Result<(), String> {
+/// Elevate via PowerShell Start-Process. Arguments must already be validated
+/// (bus id / distro) so they cannot break out of the ArgumentList array.
+fn run_elevated_usbipd(args: &[&str]) -> Result<(), String> {
+    let arg_list = args
+        .iter()
+        .map(|arg| format!("'{}'", arg.replace('\'', "''")))
+        .collect::<Vec<_>>()
+        .join(", ");
+
     let ps_command = format!(
-        "Start-Process -FilePath 'cmd.exe' -ArgumentList '/C {command}' -Verb RunAs -Wait -WindowStyle Hidden"
+        "Start-Process -FilePath 'usbipd' -ArgumentList @({arg_list}) -Verb RunAs -Wait -WindowStyle Hidden"
     );
 
     let output = Command::new("powershell")
@@ -140,27 +174,46 @@ pub fn run_elevated_usbipd_command(command: &str) -> Result<(), String> {
 }
 
 pub fn run_usbipd_bind(bus_id: &str) -> Result<(), String> {
-    run_elevated_usbipd_command(&format!("usbipd bind --busid {bus_id} --force"))
+    validate_bus_id(bus_id)?;
+    run_elevated_usbipd(&["bind", "--busid", bus_id, "--force"])
 }
 
 pub fn run_usbipd_unbind(bus_id: &str) -> Result<(), String> {
-    run_elevated_usbipd_command(&format!("usbipd unbind --busid {bus_id}"))
+    validate_bus_id(bus_id)?;
+    run_elevated_usbipd(&["unbind", "--busid", bus_id])
 }
 
 pub fn run_usbipd_attach(bus_id: &str, wsl_distro: &str) -> Result<(), String> {
+    validate_bus_id(bus_id)?;
+    validate_wsl_distro(wsl_distro)?;
     run_usbipd_command(&["attach", "--wsl", wsl_distro, "--busid", bus_id])
 }
 
 pub fn run_usbipd_detach(bus_id: &str) -> Result<(), String> {
+    validate_bus_id(bus_id)?;
     run_usbipd_command(&["detach", "--busid", bus_id])
 }
 
-pub fn attach_auto_command(bus_id: &str, wsl_distro: &str) -> String {
-    format!("usbipd attach --wsl {wsl_distro} --busid {bus_id} --auto-attach")
+pub fn spawn_auto_attach(bus_id: &str, wsl_distro: &str) -> Result<std::process::Child, String> {
+    validate_bus_id(bus_id)?;
+    validate_wsl_distro(wsl_distro)?;
+    Command::new("usbipd")
+        .args([
+            "attach",
+            "--wsl",
+            wsl_distro,
+            "--busid",
+            bus_id,
+            "--auto-attach",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("Не удалось запустить Auto-Attach: {e}"))
 }
 
 pub fn is_bindable_state(state: &str) -> bool {
-    state == "Not shared" || state == "Unknown"
+    state == "Not shared"
 }
 
 pub fn is_unbindable_state(state: &str) -> bool {
@@ -168,7 +221,7 @@ pub fn is_unbindable_state(state: &str) -> bool {
 }
 
 pub fn is_auto_attachable_state(state: &str) -> bool {
-    state == "Shared"
+    state == "Shared" || state == "Shared (forced)"
 }
 
 #[cfg(test)]
@@ -221,5 +274,25 @@ GUID                                  DEVICE
             format_device_display(&device, true),
             "2-7: Reader [Not shared] [Auto-Attach]"
         );
+    }
+
+    #[test]
+    fn validates_bus_id() {
+        assert!(validate_bus_id("2-7").is_ok());
+        assert!(validate_bus_id("12-34").is_ok());
+        assert!(validate_bus_id("").is_err());
+        assert!(validate_bus_id("2").is_err());
+        assert!(validate_bus_id("2-7;calc").is_err());
+        assert!(validate_bus_id("2-7 & whoami").is_err());
+        assert!(validate_bus_id("../x").is_err());
+    }
+
+    #[test]
+    fn validates_wsl_distro() {
+        assert!(validate_wsl_distro("Ubuntu-24.04").is_ok());
+        assert!(validate_wsl_distro("Debian").is_ok());
+        assert!(validate_wsl_distro("").is_err());
+        assert!(validate_wsl_distro("Ubuntu & calc").is_err());
+        assert!(validate_wsl_distro("Ubuntu';calc").is_err());
     }
 }
