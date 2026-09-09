@@ -6,8 +6,8 @@ use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::iter::once;
 use std::mem;
-use std::os::windows::io::AsRawHandle;
 use std::os::windows::ffi::OsStrExt;
+use std::os::windows::io::AsRawHandle;
 use std::process::Child;
 use std::ptr;
 use std::thread;
@@ -17,6 +17,7 @@ use usbipd::{
     is_auto_attachable_state, is_bindable_state, is_unbindable_state, run_usbipd_attach,
     run_usbipd_bind, run_usbipd_detach, run_usbipd_unbind, spawn_auto_attach, validate_wsl_distro,
 };
+use winapi::ctypes::c_void;
 use winapi::shared::minwindef::{LPARAM, LRESULT, UINT, WPARAM};
 use winapi::shared::windef::{HFONT, HMENU, HWND};
 use winapi::um::handleapi::{CloseHandle, INVALID_HANDLE_VALUE};
@@ -38,7 +39,6 @@ use winapi::um::winuser::{
     SW_SHOW, WM_COMMAND, WM_DESTROY, WM_SETFONT, WM_SIZE, WNDCLASSW, WS_CHILD, WS_CLIPCHILDREN,
     WS_OVERLAPPEDWINDOW, WS_VISIBLE, WS_VSCROLL,
 };
-use winapi::ctypes::c_void;
 
 const ID_LIST: i32 = 100;
 const ID_BIND: i32 = 101;
@@ -279,8 +279,15 @@ fn main() {
             create_button(hwnd, h_instance, label, id, style);
         }
 
-        for id in [ID_BIND, ID_UNBIND, ID_ATTACH, ID_DETACH, ID_AUTO_ATTACH, ID_STOP_AUTO, ID_REFRESH]
-        {
+        for id in [
+            ID_BIND,
+            ID_UNBIND,
+            ID_ATTACH,
+            ID_DETACH,
+            ID_AUTO_ATTACH,
+            ID_STOP_AUTO,
+            ID_REFRESH,
+        ] {
             let hwnd_button = GetDlgItem(hwnd, id);
             SendMessageW(hwnd_button, WM_SETFONT, font as WPARAM, 1 as LPARAM);
         }
@@ -362,12 +369,7 @@ unsafe fn layout_controls(hwnd: HWND) {
     let btn_w = 100;
     let gap = 10;
 
-    let row1 = [
-        (ID_BIND, 0),
-        (ID_UNBIND, 1),
-        (ID_ATTACH, 2),
-        (ID_DETACH, 3),
-    ];
+    let row1 = [(ID_BIND, 0), (ID_UNBIND, 1), (ID_ATTACH, 2), (ID_DETACH, 3)];
     for (id, idx) in row1 {
         let x = margin + idx * (btn_w + gap);
         MoveWindow(GetDlgItem(hwnd, id), x, row1_y, btn_w, button_h, 1);
@@ -414,9 +416,7 @@ unsafe extern "system" fn wnd_proc(
                 ID_DETACH => handle_detach(hwnd, hwnd_list, state),
                 ID_AUTO_ATTACH => handle_auto_attach(hwnd, hwnd_list, state),
                 ID_STOP_AUTO => handle_stop_auto_attach(hwnd, hwnd_list, state),
-                ID_REFRESH => {
-                    populate_usb_list(hwnd_list, hwnd, &state.config.auto_attach_devices)
-                }
+                ID_REFRESH => populate_usb_list(hwnd_list, hwnd, &state.config.auto_attach_devices),
                 _ => {}
             }
             0
